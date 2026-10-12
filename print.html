@@ -74,6 +74,19 @@
       #status.err {
         color: #ff8a8a;
       }
+      .note {
+        width: 100%;
+        max-width: 460px;
+        background: #1a1500;
+        border: 1px solid #4a3d00;
+        color: #e8d48a;
+        border-radius: 12px;
+        padding: 10px 14px;
+        font-size: 13px;
+        line-height: 1.7;
+        margin-bottom: 12px;
+        display: none;
+      }
       .bar {
         width: 100%;
         max-width: 460px;
@@ -150,7 +163,11 @@
     </div>
     <div id="status"></div>
     <div class="bar" id="bar"><i id="fill"></i></div>
+    <div class="note" id="note"></div>
     <button id="go" disabled>اتصال بالطابعة وطباعة</button>
+    <button class="sec" id="restart" style="display: none">
+      ألغِ الطباعة اللي اتقطعت وابدأ من الأول
+    </button>
     <button class="sec" id="alt" style="display: none">
       قناة بديلة ثم اطبع تاني
     </button>
@@ -171,6 +188,7 @@
       // ---------- نفس إعدادات برنت تيما الشغالة ----------
       const FIXED_CHANNEL = 1; // القناة التانية بعد الترتيب
       const CH_KEY = 'ouda_ch';
+      const JOB_KEY = 'ouda_job'; // آخر طباعة (لو اتقطعت)
       const CK = 100,
         CK_FALLBACK = 20,
         DELAY = 10;
@@ -191,12 +209,16 @@
       let bytes = null,
         device = null,
         chars = [],
-        idx = 0;
+        idx = 0,
+        JOB_ID = '',
+        LAY = null,
+        printedOnce = false;
 
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       function ls(k, v) {
         try {
           if (v === undefined) return localStorage.getItem(k);
+          if (v === null) return localStorage.removeItem(k);
           localStorage.setItem(k, v);
         } catch (e) {}
       }
@@ -250,21 +272,103 @@
         return new Uint8Array(await new Response(ds.readable).arrayBuffer());
       }
 
-      /* معاينة: بنفك أوامر الصورة (GS v 0) ونرسمها */
-      function preview(b) {
-        let p = 2,
-          bands = [],
-          W = 0,
-          H = 0;
+      /* ---------- هيكل الفاتورة (شرايح الصورة) ---------- */
+      function layout(b) {
+        const bands = [];
+        let p = 2;
         while (p + 8 <= b.length && b[p] === 0x1d && b[p + 1] === 0x76) {
           const rb = b[p + 4] | (b[p + 5] << 8),
             h = b[p + 6] | (b[p + 7] << 8);
-          bands.push({ rb, h, at: p + 8 });
-          W = rb * 8;
-          H += h;
-          p += 8 + rb * h;
+          const e = p + 8 + rb * h;
+          bands.push({ s: p, e, rb, h });
+          p = e;
         }
+        return { bands, bodyEnd: p };
+      }
+      // لو الإرسال وقف عند البايت pos: كام بايت فاضي نكمّل بيهم الأمر الحالي، وإحنا نكمل منين
+      function plan(pos) {
+        const len = bytes.length;
+        if (pos <= 0) return { pad: 0, start: 0 };
+        if (pos < 2) return { pad: 2, start: 0 };
+        if (pos >= len) return { pad: 0, start: len };
+        for (const b of LAY.bands) {
+          if (pos <= b.s) return { pad: 0, start: pos };
+          if (pos < b.e) return { pad: b.e - pos, start: b.e };
+        }
+        if (pos === LAY.bodyEnd) return { pad: 0, start: pos };
+        return { pad: 4, start: LAY.bodyEnd };
+      }
+      function hashBytes(b) {
+        let h = 0x811c9dc5;
+        for (let i = 0; i < b.length; i++) {
+          h ^= b[i];
+          h = Math.imul(h, 0x01000193);
+        }
+        return b.length + '-' + (h >>> 0).toString(36);
+      }
+
+      /* ---------- حفظ حالة الطباعة (عشان لو اتقطعت) ---------- */
+      function getJob() {
+        try {
+          return JSON.parse(ls(JOB_KEY) || 'null');
+        } catch (e) {
+          return null;
+        }
+      }
+      function saveJob(pos) {
+        ls(
+          JOB_KEY,
+          JSON.stringify({
+            id: JOB_ID,
+            total: bytes.length,
+            pos,
+            pad: plan(pos).pad,
+            t: Date.now(),
+          }),
+        );
+      }
+      function clearJob() {
+        ls(JOB_KEY, null);
+      }
+      function interrupted() {
+        const j = getJob();
+        return j && j.pos < j.total ? j : null;
+      }
+
+      function updateUI() {
+        if (!bytes) return;
+        const j = interrupted(),
+          same = j && j.id === JOB_ID;
+        const pct = j ? Math.round((j.pos * 100) / j.total) : 0;
+        $('restart').style.display = same ? '' : 'none';
+        $('go').textContent = same
+          ? 'كمّل الطباعة (' + pct + '%)'
+          : printedOnce
+            ? 'اطبع تاني'
+            : 'اتصال بالطابعة وطباعة';
+        const n = $('note');
+        if (same) {
+          n.style.display = 'block';
+          n.textContent =
+            'الطباعة اتقطعت عند ' +
+            pct +
+            '%. "كمّل" بيكمل الباقي (ممكن يظهر فراغ أبيض صغير حوالي 8 مم عند مكان القطع). لو الطابعة اتطفت أو اتعمل لها إعادة تشغيل اختار "ألغِ وابدأ من الأول".';
+        } else if (j) {
+          n.style.display = 'block';
+          n.textContent =
+            'فيه طباعة قديمة اتقطعت. هتتلغي تلقائي قبل ما تبدأ الطباعة دي.';
+        } else {
+          n.style.display = 'none';
+        }
+      }
+
+      /* معاينة: بنفك أوامر الصورة (GS v 0) ونرسمها */
+      function preview(b) {
+        const L = layout(b),
+          bands = L.bands;
         if (!bands.length) throw new Error('bad');
+        const W = bands[0].rb * 8,
+          H = bands.reduce((s, x) => s + x.h, 0);
         const c = document.createElement('canvas');
         c.width = W;
         c.height = H;
@@ -275,7 +379,8 @@
         bands.forEach((bd) => {
           for (let yy = 0; yy < bd.h; yy++, row++)
             for (let xx = 0; xx < W; xx++) {
-              const on = b[bd.at + yy * bd.rb + (xx >> 3)] & (0x80 >> (xx & 7)),
+              const on =
+                  b[bd.s + 8 + yy * bd.rb + (xx >> 3)] & (0x80 >> (xx & 7)),
                 i = (row * W + xx) * 4;
               d[i] = d[i + 1] = d[i + 2] = on ? 0 : 255;
               d[i + 3] = 255;
@@ -293,9 +398,12 @@
           let u = fromB64Url(h.slice(2));
           if (h.startsWith('g.')) u = await gunzip(u);
           bytes = u;
+          LAY = layout(bytes);
+          JOB_ID = hashBytes(bytes);
           preview(bytes);
           $('go').disabled = false;
           st('الفاتورة جاهزة');
+          updateUI();
         } catch (e) {
           $('wrap').innerHTML =
             '<div class="empty">مفيش فاتورة — ارجع للتطبيق واضغط طباعة</div>';
@@ -456,15 +564,15 @@
         await openGatt();
       }
 
-      // كتابة بنفس منطق تيما: Write مع تأكيد لو متاح، وحزمة 100 ← 20 عند الفشل
-      async function write(data) {
+      // كتابة بنفس منطق تيما. track=true بيحفظ مكان الوقوف بعد كل حزمة، quiet=true من غير شريط تقدم
+      async function write(data, from, track, quiet) {
         const c = chars[idx];
         const canNoResp =
           !!c.properties.writeWithoutResponse && !!c.writeValueWithoutResponse;
         const canResp = !!c.properties.write;
         let useNoResp = !canResp && canNoResp;
         let ck = CK,
-          pos = 0;
+          pos = from || 0;
         while (pos < data.length) {
           const part = data.slice(pos, pos + ck);
           try {
@@ -473,9 +581,12 @@
               await c.writeValueWithResponse(part);
             else await c.writeValue(part);
             pos += part.length;
-            const pc = Math.round((pos * 100) / data.length);
-            prog(pc);
-            st('جاري الطباعة... ' + pc + '%');
+            if (track) saveJob(pos);
+            if (!quiet) {
+              const pc = Math.round((pos * 100) / data.length);
+              prog(pc);
+              st('جاري الطباعة... ' + pc + '%');
+            }
             if (DELAY) await sleep(DELAY);
           } catch (e) {
             if (ck > CK_FALLBACK) {
@@ -491,20 +602,46 @@
         }
       }
 
-      async function run() {
-        const btn = $('go');
+      // إلغاء طباعة اتقطعت: نكمل الأمر الحالي بأصفار (بتتجاهلها الطابعة) وبعدين نعمل ريسيت
+      async function flush(pad) {
+        st('بيلغي الطباعة اللي اتقطعت...');
+        if (pad > 0) await write(new Uint8Array(pad), 0, false, true);
+        await write(Uint8Array.of(0x1b, 0x40), 0, false, true);
+        await sleep(200);
+      }
+
+      async function run(mode) {
+        const btn = $('go'),
+          rs = $('restart');
         btn.disabled = true;
+        rs.disabled = true;
         $('alt').style.display = 'none';
         try {
           if (!ready()) await connectFlow();
           onCh();
-          prog(0);
+          const j = interrupted(),
+            same = j && j.id === JOB_ID;
+          let from = 0;
+          if (j && (!same || mode === 'restart')) {
+            await flush(j.pad || 0); // طباعة قديمة أو طلب "ابدأ من الأول"
+            clearJob();
+          } else if (same && mode === 'resume') {
+            const p = plan(j.pos);
+            if (p.pad > 0) {
+              st('بيكمل من مكان الوقوف...');
+              await write(new Uint8Array(p.pad), 0, false, true);
+            }
+            from = p.start;
+          }
+          prog(from ? Math.round((from * 100) / bytes.length) : 0);
           st('جاري الطباعة...');
-          await write(bytes);
+          saveJob(from);
+          await write(bytes, from, true, false);
+          clearJob();
           ls(CH_KEY, String(idx));
           prog(100);
           st('✔ تمت الطباعة', 'ok');
-          btn.textContent = 'اطبع تاني';
+          printedOnce = true;
         } catch (e) {
           prog(null);
           if (e && e.name === 'NotFoundError')
@@ -520,6 +657,8 @@
           if (chars.length > 1) $('alt').style.display = '';
         } finally {
           btn.disabled = false;
+          rs.disabled = false;
+          updateUI();
         }
       }
       function altChannel() {
@@ -529,9 +668,13 @@
         st(
           'اتغيّرت القناة لـ ' + (idx + 1) + '/' + chars.length + ' — بيطبع...',
         );
-        run();
+        run('restart');
       }
-      $('go').onclick = run;
+      $('go').onclick = () => {
+        const j = interrupted();
+        run(j && j.id === JOB_ID ? 'resume' : 'auto');
+      };
+      $('restart').onclick = () => run('restart');
       $('alt').onclick = altChannel;
     </script>
   </body>
