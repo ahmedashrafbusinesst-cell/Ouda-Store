@@ -68,6 +68,12 @@
         word-break: break-word;
         max-width: 460px;
       }
+      #status.ok {
+        color: #7ee2a0;
+      }
+      #status.err {
+        color: #ff8a8a;
+      }
       .bar {
         width: 100%;
         max-width: 460px;
@@ -76,11 +82,7 @@
         border-radius: 99px;
         overflow: hidden;
         margin-bottom: 14px;
-        opacity: 0;
-        transition: 0.2s;
-      }
-      .bar.on {
-        opacity: 1;
+        display: none;
       }
       .bar i {
         display: block;
@@ -100,6 +102,14 @@
         font: 700 17px 'Cairo';
         cursor: pointer;
       }
+      button.sec {
+        background: #1c1c1c;
+        color: #fff;
+        border: 1px solid #333;
+        font-size: 14px;
+        padding: 12px;
+        margin-top: 10px;
+      }
       button:disabled {
         opacity: 0.35;
       }
@@ -114,15 +124,22 @@
         max-width: 460px;
         line-height: 1.7;
       }
-      #dbg {
-        margin-top: 10px;
-        color: #55524c;
-        font-size: 11px;
-        text-align: left;
-        direction: ltr;
+      details {
+        width: 100%;
         max-width: 460px;
-        white-space: pre-wrap;
-        word-break: break-all;
+        margin-top: 14px;
+        color: #9c9890;
+        font-size: 13px;
+      }
+      select {
+        width: 100%;
+        margin-top: 8px;
+        background: #111;
+        color: #fff;
+        border: 1px solid #333;
+        border-radius: 10px;
+        padding: 10px;
+        font: 14px 'Cairo';
       }
     </style>
   </head>
@@ -134,51 +151,88 @@
     <div id="status"></div>
     <div class="bar" id="bar"><i id="fill"></i></div>
     <button id="go" disabled>اتصال بالطابعة وطباعة</button>
+    <button class="sec" id="alt" style="display: none">
+      قناة بديلة ثم اطبع تاني
+    </button>
     <div class="hint">
       شغّل بلوتوث الطابعة وتأكد إنها مش متوصلة بتطبيق أو موبايل تاني، وافتح
       الصفحة دي من Bluefy.<br />اختار الطابعة من القائمة مرة واحدة وبعدها
       الطباعة بتتكرر بضغطة.
     </div>
-    <div id="dbg"></div>
+    <details>
+      <summary>إعدادات متقدمة</summary>
+      <label style="display: block; margin-top: 8px">قناة الكتابة</label>
+      <select id="chSel"></select>
+    </details>
 
     <script>
       const $ = (id) => document.getElementById(id);
+
+      // ---------- نفس إعدادات برنت تيما الشغالة ----------
+      const FIXED_CHANNEL = 1; // القناة التانية بعد الترتيب
+      const CH_KEY = 'ouda_ch';
+      const CK = 100,
+        CK_FALLBACK = 20,
+        DELAY = 10;
       const SERVICES = [
-        0x18f0,
-        0xff00,
-        0xffe0,
-        0xfee7,
-        0xfff0,
-        0xae00,
-        0xffe5,
-        0xff12,
+        '000018f0-0000-1000-8000-00805f9b34fb',
+        '0000ff00-0000-1000-8000-00805f9b34fb',
+        '0000ff12-0000-1000-8000-00805f9b34fb',
+        '0000ffe0-0000-1000-8000-00805f9b34fb',
+        '0000ffe5-0000-1000-8000-00805f9b34fb',
+        '0000fff0-0000-1000-8000-00805f9b34fb',
+        '0000ae30-0000-1000-8000-00805f9b34fb',
+        '0000fee7-0000-1000-8000-00805f9b34fb',
         'e7810a71-73ae-499d-8c15-faa9aef0c3f2',
         '49535343-fe7d-4ae5-8fa9-9fafd205e455',
-        '0000ff00-0000-1000-8000-00805f9b34fb',
+        '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
       ];
-      // القنوات المعروفة للطابعات الحرارية (الأولوية للأعلى)
-      const PREFER = [
-        '00002af1',
-        'ff02',
-        'ffe1',
-        'bef8d6c9-9c21-4c9e-b632-bd58c1009f9f',
-        '49535343-8841-43f4-a8d4-ecbe34729bb3',
-        'ae01',
-      ];
-      let bytes = null,
-        dev = null,
-        chars = [];
 
-      const status = (t, bad) => {
-        $('status').textContent = t;
-        $('status').style.color = bad ? '#ff8a8a' : '#cfcac0';
-      };
-      const dbg = (t) => {
-        $('dbg').textContent = t;
-      };
+      let bytes = null,
+        device = null,
+        chars = [],
+        idx = 0;
+
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-      const errText = (e) =>
-        (e && (e.name ? e.name + ': ' : '') + (e.message || e)) || String(e);
+      function ls(k, v) {
+        try {
+          if (v === undefined) return localStorage.getItem(k);
+          localStorage.setItem(k, v);
+        } catch (e) {}
+      }
+      function st(t, cls) {
+        const e = $('status');
+        if (!cls) e.dataset.stage = t;
+        e.textContent = t;
+        e.className = cls || '';
+      }
+      function prog(p) {
+        const b = $('bar');
+        b.style.display = p == null ? 'none' : 'block';
+        $('fill').style.width = (p || 0) + '%';
+      }
+      function withTimeout(p, ms, label) {
+        return Promise.race([
+          p,
+          new Promise((_, rej) =>
+            setTimeout(
+              () => rej(new Error('انتهى الوقت في مرحلة: ' + label)),
+              ms,
+            ),
+          ),
+        ]);
+      }
+      function errText(e) {
+        let name = (e && e.name) || typeof e,
+          msg = '';
+        try {
+          msg =
+            (e && e.message) || (typeof e === 'string' ? e : JSON.stringify(e));
+        } catch (x) {
+          msg = String(e);
+        }
+        return '[' + name + '] ' + msg;
+      }
 
       function fromB64Url(s) {
         s = s.replace(/-/g, '+').replace(/_/g, '/');
@@ -241,125 +295,244 @@
           bytes = u;
           preview(bytes);
           $('go').disabled = false;
-          status('الفاتورة جاهزة');
+          st('الفاتورة جاهزة');
         } catch (e) {
           $('wrap').innerHTML =
             '<div class="empty">مفيش فاتورة — ارجع للتطبيق واضغط طباعة</div>';
-          status('', true);
+          st('', 'err');
         }
       })();
 
-      /* ---------- البلوتوث ---------- */
-      async function pickDevice() {
-        if (!navigator.bluetooth)
-          throw new Error('البلوتوث مش مدعوم هنا — افتح الصفحة من Bluefy');
-        if (dev) return;
-        status('اختار الطابعة...');
-        dev = await navigator.bluetooth.requestDevice({
-          acceptAllDevices: true,
-          optionalServices: SERVICES,
-        });
+      /* ---------- البلوتوث (منقول من برنت تيما) ---------- */
+      function score(c) {
+        const u = (c.service && c.service.uuid) || '';
+        if (u.indexOf('000018f0') === 0) return 0;
+        if (u.indexOf('e7810a71') === 0) return 1;
+        if (u.indexOf('49535343') === 0) return 2;
+        return 3;
       }
+      function shortUuid(u) {
+        u = String(u || '');
+        return u.indexOf('0000') === 0 &&
+          u.slice(8) === '-0000-1000-8000-00805f9b34fb'
+          ? u.slice(4, 8)
+          : u.slice(0, 8);
+      }
+      function fillCh() {
+        const sel = $('chSel');
+        sel.innerHTML = '';
+        chars.forEach((c, i) => {
+          const p = [];
+          if (c.properties.write) p.push('W');
+          if (c.properties.writeWithoutResponse) p.push('WNR');
+          const o = document.createElement('option');
+          o.value = i;
+          o.textContent =
+            i +
+            1 +
+            ') ' +
+            shortUuid(c.service && c.service.uuid) +
+            ' / ' +
+            shortUuid(c.uuid) +
+            ' [' +
+            p.join('+') +
+            ']';
+          sel.appendChild(o);
+        });
+        sel.value = idx;
+      }
+      function onCh() {
+        const v = parseInt($('chSel').value, 10);
+        if (v >= 0 && v < chars.length) idx = v;
+      }
+      $('chSel').onchange = onCh;
 
-      const rank = (c) => {
-        const u = c.uuid.toLowerCase(),
-          i = PREFER.findIndex((p) => u.includes(p));
-        return i < 0 ? 99 : i;
-      };
-
-      // بنعيد الاتصال ونكتشف القنوات في كل طباعة (بيمنع أخطاء الـ handle القديمة)
-      async function discover() {
-        status('بتوصل بالطابعة...');
-        try {
-          if (dev.gatt.connected) {
-            dev.gatt.disconnect();
-            await sleep(400);
-          }
-        } catch (e) {}
-        const srv = await dev.gatt.connect();
-        chars = [];
-        for (const s of await srv.getPrimaryServices()) {
-          for (const c of await s.getCharacteristics()) {
-            if (c.properties.writeWithoutResponse || c.properties.write)
-              chars.push(c);
-          }
-        }
-        if (!chars.length) throw new Error('مش لاقي قناة كتابة في الطابعة');
-        chars.sort((a, b) => rank(a) - rank(b));
-        dbg(
-          'channels: ' +
-            chars
-              .map(
-                (c) =>
-                  c.uuid.slice(0, 8) +
-                  (c.properties.write ? ' W' : '') +
-                  (c.properties.writeWithoutResponse ? ' WNR' : ''),
-              )
-              .join(' | '),
+      function ready() {
+        return !!(
+          device &&
+          device.gatt &&
+          device.gatt.connected &&
+          chars.length
         );
       }
 
-      async function put(c, part) {
-        if (c.properties.write && c.writeValueWithResponse)
-          return c.writeValueWithResponse(part);
-        if (c.properties.write) return c.writeValue(part);
-        return c.writeValueWithoutResponse(part);
+      async function openGatt() {
+        try {
+          st('2/4 جاري الاتصال بالطابعة...');
+          const server = await withTimeout(
+            device.gatt.connect(),
+            20000,
+            'الاتصال بالطابعة',
+          );
+          st('3/4 جاري قراءة الخدمات...');
+          const svcs = await withTimeout(
+            server.getPrimaryServices(),
+            20000,
+            'قراءة الخدمات',
+          );
+          st('4/4 جاري تجهيز قناة الكتابة...');
+          chars = [];
+          for (const s of svcs) {
+            const cs = await withTimeout(
+              s.getCharacteristics(),
+              20000,
+              'قراءة القنوات',
+            );
+            cs.forEach((c) => {
+              if (c.properties.write || c.properties.writeWithoutResponse)
+                chars.push(c);
+            });
+          }
+          if (!chars.length)
+            throw new Error('الطابعة اتصلت بس مفيش قناة كتابة.');
+          chars.sort((a, b) => score(a) - score(b));
+          const saved = parseInt(ls(CH_KEY), 10);
+          idx =
+            saved >= 0 && saved < chars.length
+              ? saved
+              : FIXED_CHANNEL < chars.length
+                ? FIXED_CHANNEL
+                : 0;
+          fillCh();
+        } catch (e) {
+          try {
+            device.gatt.disconnect();
+          } catch (x) {}
+          throw e;
+        }
       }
 
-      // اختبار بأمر ESC @ (تهيئة) — آمن ومش بيطبع حاجة — عشان نعرف القناة وحجم الحزمة الصح
-      async function pickChannel() {
-        let last;
-        for (const c of chars) {
-          for (const CH of [100, 20]) {
-            try {
-              const probe = new Uint8Array(CH);
-              for (let i = 0; i < CH; i += 2) {
-                probe[i] = 0x1b;
-                probe[i + 1] = 0x40;
-              }
-              await put(c, probe);
-              return { c, CH };
-            } catch (e) {
-              last = e;
-            }
+      async function requestWithFallback() {
+        const short = [
+          '000018f0-0000-1000-8000-00805f9b34fb',
+          '0000ffe0-0000-1000-8000-00805f9b34fb',
+          '49535343-fe7d-4ae5-8fa9-9fafd205e455',
+        ];
+        const attempts = [
+          {
+            label: 'قايمة كاملة',
+            opts: { acceptAllDevices: true, optionalServices: SERVICES },
+          },
+          {
+            label: 'قايمة مختصرة',
+            opts: { acceptAllDevices: true, optionalServices: short },
+          },
+          { label: 'من غير خدمات', opts: { acceptAllDevices: true } },
+        ];
+        let lastErr;
+        const tried = [];
+        for (const a of attempts) {
+          try {
+            st('1/4 اختار الطابعة من القايمة... (' + a.label + ')');
+            return await navigator.bluetooth.requestDevice(a.opts);
+          } catch (e) {
+            lastErr = e;
+            tried.push(a.label + ': ' + errText(e));
+            if (e && e.name === 'NotFoundError') throw e;
           }
         }
-        throw last || new Error('الطابعة مش بتقبل بيانات');
+        const err = new Error('فشلت كل الطرق → ' + tried.join(' || '));
+        err.name = (lastErr && lastErr.name) || 'Error';
+        throw err;
       }
 
-      async function send(b, ch) {
-        $('bar').classList.add('on');
-        for (let i = 0; i < b.length; i += ch.CH) {
-          await put(ch.c, b.slice(i, i + ch.CH));
-          $('fill').style.width =
-            Math.round((Math.min(b.length, i + ch.CH) / b.length) * 100) + '%';
-          await sleep(ch.CH > 20 ? 25 : 15);
-        }
-      }
-
-      $('go').onclick = async () => {
-        $('go').disabled = true;
-        try {
-          await pickDevice();
-          await discover();
-          const ch = await pickChannel();
-          status('بيطبع...');
-          await send(bytes, ch);
-          status('تمت الطباعة ✓');
-          $('go').textContent = 'اطبع تاني';
-        } catch (e) {
-          if (e && e.name === 'NotFoundError')
-            status('اتلغى اختيار الطابعة', true);
-          else status('خطأ: ' + errText(e), true);
-          chars = [];
+      async function connectFlow() {
+        if (!navigator.bluetooth)
+          throw new Error(
+            'المتصفح مش بيدعم البلوتوث — افتح الصفحة من تطبيق Bluefy',
+          );
+        if (device) {
           try {
-            if (dev && dev.gatt.connected) dev.gatt.disconnect();
-          } catch (x) {}
+            await openGatt();
+            return;
+          } catch (e) {
+            device = null;
+          }
         }
-        setTimeout(() => $('bar').classList.remove('on'), 800);
-        $('fill').style.width = '0';
-        $('go').disabled = false;
-      };
+        device = await requestWithFallback();
+        device.addEventListener('gattserverdisconnected', () => {
+          chars = [];
+        });
+        await openGatt();
+      }
+
+      // كتابة بنفس منطق تيما: Write مع تأكيد لو متاح، وحزمة 100 ← 20 عند الفشل
+      async function write(data) {
+        const c = chars[idx];
+        const canNoResp =
+          !!c.properties.writeWithoutResponse && !!c.writeValueWithoutResponse;
+        const canResp = !!c.properties.write;
+        let useNoResp = !canResp && canNoResp;
+        let ck = CK,
+          pos = 0;
+        while (pos < data.length) {
+          const part = data.slice(pos, pos + ck);
+          try {
+            if (useNoResp) await c.writeValueWithoutResponse(part);
+            else if (c.writeValueWithResponse)
+              await c.writeValueWithResponse(part);
+            else await c.writeValue(part);
+            pos += part.length;
+            const pc = Math.round((pos * 100) / data.length);
+            prog(pc);
+            st('جاري الطباعة... ' + pc + '%');
+            if (DELAY) await sleep(DELAY);
+          } catch (e) {
+            if (ck > CK_FALLBACK) {
+              ck = CK_FALLBACK;
+              continue;
+            }
+            if (useNoResp && canResp) {
+              useNoResp = false;
+              continue;
+            }
+            throw e;
+          }
+        }
+      }
+
+      async function run() {
+        const btn = $('go');
+        btn.disabled = true;
+        $('alt').style.display = 'none';
+        try {
+          if (!ready()) await connectFlow();
+          onCh();
+          prog(0);
+          st('جاري الطباعة...');
+          await write(bytes);
+          ls(CH_KEY, String(idx));
+          prog(100);
+          st('✔ تمت الطباعة', 'ok');
+          btn.textContent = 'اطبع تاني';
+        } catch (e) {
+          prog(null);
+          if (e && e.name === 'NotFoundError')
+            st('اتلغى اختيار الطابعة', 'err');
+          else
+            st(
+              '❌ ' +
+                errText(e) +
+                ' | مرحلة: ' +
+                ($('status').dataset.stage || '?'),
+              'err',
+            );
+          if (chars.length > 1) $('alt').style.display = '';
+        } finally {
+          btn.disabled = false;
+        }
+      }
+      function altChannel() {
+        if (chars.length < 2) return;
+        idx = (idx + 1) % chars.length;
+        $('chSel').value = idx;
+        st(
+          'اتغيّرت القناة لـ ' + (idx + 1) + '/' + chars.length + ' — بيطبع...',
+        );
+        run();
+      }
+      $('go').onclick = run;
+      $('alt').onclick = altChannel;
     </script>
   </body>
 </html>
